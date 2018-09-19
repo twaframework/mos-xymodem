@@ -7,6 +7,9 @@ An implementation that allows you to transmit files over UART via X/Ymodem
 
 ## Examples
 
+Make sure you set `debug.stdout_uart` and `debug_stderr_uart` to a different UART, as they will cause problems
+when trying to transfer the file. 
+
 Here's an example of using the library via C:
 
 ```
