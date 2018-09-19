@@ -89,6 +89,7 @@ struct mgos_xymodem_config_t mgos_xymodem_config;
 #define COUNT_ARGUMENTS(...) ELEVENTH_ARGUMENT(dummy, ## __VA_ARGS__, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
 
 void mgos_xymodem_init();
+void mgos_xymodem_set_uart(uint8_t);
 
 bool mgos_xymodem_transmit_impl(uint8_t, ...);
 #define mgos_xymodem_transmit(...) \

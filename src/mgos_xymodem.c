@@ -35,6 +35,16 @@ void mgos_xymodem_init()
 	mgos_event_add_handler(MGOS_XYMODEM_FINISH, mgos_xymodem_on_finish, NULL);
 }
 
+void mgos_xymodem_set_uart(uint8_t uart_no) {
+
+	if(uart_no > 3) {
+		LOG(LL_ERROR, ("Invalid UART Number: %d", uart_no));
+		return;
+	}
+
+	mgos_xymodem_config.uart_no = uart_no;
+}
+
 mgos_xymodem_packet *mgos_xymodem_create_packet(uint8_t type)
 {
 	mgos_xymodem_packet *retval;
