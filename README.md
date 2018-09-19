@@ -37,7 +37,7 @@ void mgos_app_on_init(int ev, void *ev_data, void *userdata)
   LOG(LL_INFO, ("App Initialized and Ready to Go"));
   LOG(LL_INFO, ("Attempting Transmission"));
 
-  fp = fopen("Levo_stm32_fireware_V-3.0.3.bin", "r");
+  fp = fopen("fireware_V-3.0.3.bin", "r");
 
   // These event handlers will let you know when the transfer is complete or a failure
   // Check the log for reasons why
