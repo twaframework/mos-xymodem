@@ -19,454 +19,403 @@
   | Authors: John Coggeshall <john@thissmarthouse.com>                   |
   +----------------------------------------------------------------------+
 */
+
 #include "mgos_xymodem.h"
-#include "mgos_uart_hal.h"
 
-bool mgos_xymodem_init(void)
+// Uncomment this and the debug will include a hex dump of each packet sent
+//#define MGOS_XYMODEM_DEBUG_HEXDUMP
+
+void mgos_xymodem_init()
 {
-	mgos_xymodem_set_protocol(MGOS_XYMODEM_PROTOCOL_YMODEM);
-	mgos_xymodem_set_crc_type(MGOS_XYMODEM_CHECKSUM_CRC_16);
-	mgos_xymodem_set_uart_no(0);
+	mgos_xymodem_config.uart_no = 0;
 
-#ifdef MGOS_XYMODEM_DEBUG
-	LOG(LL_INFO, ("Hello from XYMODEM"));
-#endif
-	return true;
+	mgos_event_register_base(MGOS_XYMODEM_EVENT_BASE, "xymodem");
+
+	mgos_event_add_handler(MGOS_XYMODEM_SEND_PACKET, mgos_xymodem_on_send_packet, NULL);
+	mgos_event_add_handler(MGOS_XYMODEM_FINISH, mgos_xymodem_on_finish, NULL);
 }
 
-uint8_t mgos_xymodem_read_uart_byte()
+mgos_xymodem_packet *mgos_xymodem_create_packet(uint8_t type)
 {
-	uint8_t inByte;
-	uint16_t timeout = 5000;
+	mgos_xymodem_packet *retval;
+
+	LOG(LL_DEBUG, ("Creating new data packet of type 0x%02x", type));
+
+	retval = malloc(sizeof(mgos_xymodem_packet));
+
+	if(type == MGOS_XYMODEM_SOH) {
+		retval->payload = malloc(sizeof(uint8_t) * 128);
+		memset(retval->payload, 0x0, sizeof(uint8_t) * 128);
+	} else if(type == MGOS_XYMODEM_STX) {
+		retval->payload = malloc(sizeof(uint8_t) * 1024);
+		memset(retval->payload, 0x0, sizeof(uint8_t) * 1024);
+	} else {
+		LOG(LL_ERROR, ("Cannot create invalid packet type: %02x", type));
+		free(retval);
+		return NULL;
+	}
+
+	retval->type = type;
+	retval->retries = 0;
+	retval->fp = NULL;
+	retval->file_size = 0;
+	retval->number = 0;
+	retval->bytes_sent = 0;
+	retval->is_final = false;
+
+	return retval;
+}
+
+uint8_t mgos_xymodem_read_byte()
+{
+	uint8_t tByte;
+	uint16_t timeout = 30000;
 
 	do {
 		mgos_msleep(1000);
-		timeout -= 100;
-
-#ifdef MGOS_XYMODEM_DEBUG
-		LOG(LL_INFO, ("Attempting to read a byte from UART %d (timeout in %d)", mgos_xymodem_state.uart_no, timeout));
-#endif
-
-	} while((mgos_uart_read(mgos_xymodem_state.uart_no, &inByte, 1) <= 0) && (timeout > 0));
+		timeout -= 1000;
+		LOG(LL_DEBUG, ("Attempting to read a byte from UART #%d (timeout: %d)", MGOS_XYMODEM_UART_NO, timeout));
+	} while((mgos_uart_read(MGOS_XYMODEM_UART_NO, &tByte, 1) <= 0) && (timeout > 0));
 
 	if(timeout <= 0) {
-		return 0;
+		LOG(LL_INFO, ("Failed to read a byte from UART"));
+		return 0x0;
 	}
 
-	return inByte;
-}
-
-enum mgos_xymodem_checksum_t mgos_xymodem_determine_checksum()
-{
-	switch(mgos_xymodem_read_uart_byte()) {
-		case MGOS_XYMODEM_CRC16:
-			mgos_xymodem_state.checksum_type = MGOS_XYMODEM_CHECKSUM_CRC_16;
-			break;
-		case MGOS_XYMODEM_NAK:
-			mgos_xymodem_state.checksum_type = MGOS_XYMODEM_CHECKSUM_OLD;
-			break;
-		case 0:
-		default:
-			mgos_xymodem_state.checksum_type = MGOS_XYMODEM_CHECKSUM_NONE;
-			break;
+	if(tByte == 0x0) {
+		return mgos_xymodem_read_byte();
 	}
 
-	return mgos_xymodem_state.checksum_type;
+	return tByte;
 }
 
-void mgos_xymodem_flush_read_buffer()
+bool mgos_xymodem_transmit_impl(uint8_t param_count, ...)
 {
-	uint8_t inByte;
+	FILE *fp;
+	va_list v;
+	char *filename;
 
-	while(mgos_uart_read(mgos_xymodem_state.uart_no, &inByte, 1) > 0);
-}
+	va_start(v, param_count);
 
-bool mgos_xymodem_end_transmission()
-{
-	uint8_t eot = MGOS_XYMODEM_EOT;
-	uint8_t responseByte;
-	uint8_t retries = 0;
-	uint8_t payload = 0x0;
+	LOG(LL_DEBUG, ("Beginning File Transfer"));
 
-#ifdef MGOS_XYMODEM_DEBUG
-	LOG(LL_INFO, ("Ending Transmission"));
-#endif
+	int uart_no = va_arg(v, int);
 
-	do {
-		mgos_uart_write(mgos_xymodem_state.uart_no, &eot, 1);
-		responseByte = mgos_xymodem_read_uart_byte();
-		retries++;
-	} while((responseByte != MGOS_XYMODEM_ACK) && (retries <= 10));
-
-	if(responseByte != MGOS_XYMODEM_ACK) {
-
-#ifdef MGOS_XYMODEM_DEBUG
-		LOG(LL_INFO, ("Failed to receive an ACK for our EOT"));
-#endif
-
+	if(uart_no > 3) {
+		LOG(LL_ERROR, ("Invalid UART Number for File Transfer: %d", uart_no));
 		return false;
 	}
 
-#ifdef MGOS_XYMODEM_DEBUG
-	LOG(LL_INFO, ("Received ACK for EOT"));
-#endif
+	mgos_xymodem_config.uart_no = uart_no;
 
-	if(mgos_xymodem_state.protocol == MGOS_XYMODEM_PROTOCOL_YMODEM) {
-		// Eat up the next checksum announcment because YModem expects another file to transfer
-		mgos_xymodem_determine_checksum();
+	mgos_uart_set_dispatcher(mgos_xymodem_config.uart_no, NULL, NULL);
+	mgos_uart_set_rx_enabled(mgos_xymodem_config.uart_no, true);
 
-		// Send a NULL filename
-		mgos_xymodem_state.packet_number = 0;
-		if(mgos_xymodem_send_payload(&payload, sizeof(payload), MGOS_XYMODEM_SOH) != MGOS_XYMODEM_ACK) {
-			LOG(LL_INFO, ("Failed to close YMODEM Session"));
-			return false;
-		}
+	switch(param_count) {
+		case 2:
 
+			LOG(LL_DEBUG, ("Using XModem Protocol"));
+
+			fp = va_arg(v, FILE *);
+
+			if(!mgos_xymodem_transmit_xmodem(fp)) {
+				LOG(LL_ERROR, ("Could not start XMODEM transfer"));
+				va_end(v);
+				return false;
+			}
+			va_end(v);
+
+			return true;
+		case 3:
+
+			LOG(LL_DEBUG, ("Using YModem Protocol"));
+
+			fp = va_arg(v, FILE *);
+			filename = va_arg(v, char *);
+
+			if(!mgos_xymodem_transmit_ymodem(fp, filename)) {
+				LOG(LL_ERROR, ("Could not start YMODEM transfer"));
+				va_end(v);
+				return false;
+			}
+			va_end(v);
+
+			return true;
 	}
+
+	va_end(v);
+	LOG(LL_ERROR, ("Invalid arguments to function 'mgos_xymodem_transmit()'"));
+	return false;
+}
+
+bool mgos_xymodem_determine_crc(mgos_xymodem_packet *packet)
+{
+	uint8_t tByte;
+
+	LOG(LL_INFO, ("Awaiting destination CRC preference.."));
+
+	tByte = mgos_xymodem_read_byte();
+	switch(tByte) {
+		case MGOS_XYMODEM_NAK:
+			LOG(LL_DEBUG, ("Using Checksum for data verification"));
+			packet->crc_type = MGOS_XYMODEM_CHECKSUM;
+			return true;
+		case MGOS_XYMODEM_CRC16:
+			LOG(LL_DEBUG, ("Using CRC16 for data verification"));
+			packet->crc_type = MGOS_XYMODEM_CRC_16;
+			return true;
+	}
+
+	LOG(LL_ERROR, ("Could not determine destination CRC preference, received 0x%02x", tByte));
+
+	return false;
+}
+
+bool mgos_xymodem_transmit_ymodem(FILE *fp, char *filename)
+{
+	mgos_xymodem_packet *packet;
+	char str_file_size[64] = "";
+
+	packet = mgos_xymodem_create_packet(MGOS_XYMODEM_STX);
+
+	if(!mgos_xymodem_determine_crc(packet)) {
+		MGOS_XYMODEM_FREE_PACKET(packet);
+		MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_FAILED, NULL);
+		return false;
+	}
+
+	packet->protocol = MGOS_XYMODEM_PROTOCOL_YMODEM;
+	packet->fp = fp;
+	fseek(packet->fp, 0, SEEK_END);
+
+	packet->file_size = ftell(fp);
+
+	if(packet->file_size <= 0) {
+		LOG(LL_ERROR, ("Invalid File pointer - could not determine file size or empty file"));
+		MGOS_XYMODEM_FREE_PACKET(packet);
+		return false;
+	}
+
+	fseek(packet->fp, 0, SEEK_SET);
+
+	packet->number = 0;
+
+	// @todo can we refactor this to us %s\0%zu
+	c_snprintf(str_file_size, sizeof(str_file_size), "%zu", packet->file_size);
+
+	memcpy(packet->payload, filename, strlen(filename));
+	memcpy(packet->payload + (strlen(filename) + 1), &str_file_size, strlen(str_file_size));
+
+	LOG(LL_DEBUG, ("Created header packet (filename: %s, filesize: %zu", filename, packet->file_size));
+
+	MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_SEND_PACKET, packet);
 
 	return true;
 }
 
-void mgos_xymodem_hex_dump(char *desc, void *addr, int len)
+bool mgos_xymodem_transmit_xmodem(FILE *fp)
 {
-
-#ifdef MGOS_XYMODEM_DEBUG
-    int i;
-    char buff[17];
-    unsigned char *pc = (unsigned char*)addr;
-    char outputBuffer[8192] = "";
-
-    // Output description if given.
-    if (desc != NULL) {
-    	c_snprintf(outputBuffer, sizeof(outputBuffer), "%s%s\r\n", outputBuffer, desc);
-    }
-
-    // Process every byte in the data.
-    for (i = 0; i < len; i++) {
-        // Multiple of 16 means new line (with line offset).
-
-        if ((i % 16) == 0) {
-            // Just don't print ASCII for the zeroth line.
-            if (i != 0) {
-            	c_snprintf(outputBuffer, sizeof(outputBuffer), "%s  %s\r\n", outputBuffer, buff);
-            }
-
-            c_snprintf(outputBuffer, sizeof(outputBuffer), "%s  %04x ", outputBuffer, i);
-        }
-
-        c_snprintf(outputBuffer, sizeof(outputBuffer), "%s %02x", outputBuffer, pc[i]);
-
-        // And store a printable ASCII character for later.
-        if ((pc[i] < 0x20) || (pc[i] > 0x7e))
-            buff[i % 16] = '.';
-        else
-            buff[i % 16] = pc[i];
-
-        buff[(i % 16) + 1] = '\0';
-    }
-
-    // Pad out last line if not exactly 16 characters.
-    while ((i % 16) != 0) {
-    	c_snprintf(outputBuffer, sizeof(outputBuffer), "%s   ", outputBuffer);
-        i++;
-    }
-
-    c_snprintf(outputBuffer, sizeof(outputBuffer), "%s %s\r\n", outputBuffer, buff);
-
-    LOG(LL_INFO, ("\r\n%s\r\n", outputBuffer));
-#endif
-
+	return false;
 }
 
-uint8_t mgos_xymodem_send_payload(uint8_t payload[], size_t length, uint8_t packetType)
+void mgos_xymodem_event_trigger_cb(void *event_params)
 {
-	uint8_t modemPacket[1029];
-	uint16_t crcVal;
-	uint16_t payloadLength = 0x0;
-	size_t writtenLength = 0;
-	uint8_t retries = 0;
-	uint8_t responseByte;
+	mgos_xymodem_event_params *params = (mgos_xymodem_event_params *)event_params;
+	mgos_event_trigger(params->event, params->data);
+	free(params);
+}
+
+void mgos_xymodem_on_finish(int ev, void *packet_data, void *unused)
+{
+	uint8_t eot = MGOS_XYMODEM_EOT;
+	uint8_t tByte, tries = 0;
+	mgos_xymodem_packet *packet = (mgos_xymodem_packet *)packet_data;
+	mgos_xymodem_packet *final_packet = NULL;
+
+	LOG(LL_DEBUG, ("Entering tranmission finish event on packet #%d", packet->number));
 
 	do {
+		mgos_uart_write(MGOS_XYMODEM_UART_NO, &eot, 1);
+		mgos_uart_flush(MGOS_XYMODEM_UART_NO);
+		tByte = mgos_xymodem_read_byte();
+		tries++;
+	} while((tByte != MGOS_XYMODEM_ACK) && (tries < 5));
 
-		mgos_xymodem_flush_read_buffer();
-
-#ifdef MGOS_XYMODEM_DEBUG
-		LOG(LL_INFO, ("Sending Packet #%d", mgos_xymodem_state.packet_number));
-#endif
-
-		switch(packetType) {
-			case MGOS_XYMODEM_SOH:
-				payloadLength = 128;
-				break;
-			case MGOS_XYMODEM_STX:
-				payloadLength = 1024;
-				break;
-			default:
-#ifdef MGOS_XYMODEM_DEBUG
-				LOG(LL_INFO, ("Invalid Packet Type Specified"));
-#endif
-				return 0;
-		}
-
-		if(length > payloadLength) {
-#ifdef MGOS_XYMODEM_DEBUG
-			LOG(LL_INFO, ("Specified length is larger than maximum payload length"));
-#endif
-			return 0;
-		}
-
-		memset(&modemPacket[0], 0x0, sizeof(modemPacket));
-
-		modemPacket[0] = packetType;
-		modemPacket[1] = mgos_xymodem_state.packet_number;
-		modemPacket[2] = ~mgos_xymodem_state.packet_number;
-
-		memcpy(&modemPacket[3], payload, length);
-
-		crcVal = mgos_xymodem_xmodem_crc(&modemPacket[3], 0, payloadLength);
-
-		modemPacket[payloadLength -2 + 5] = (uint8_t)(crcVal >> 8) & 0xFF;
-		modemPacket[payloadLength -1 + 5] = (uint8_t)(crcVal & 0xFF);
-#ifdef MGOS_XYMODEM_DEBUG
-		LOG(LL_INFO, ("CRC Value is %d", crcVal));
-#endif
-
-#ifdef MGOS_XYMODEM_DEBUG
-		mgos_xymodem_hex_dump(NULL, (void *)&modemPacket[0], payloadLength + 5);
-#endif
-
-		writtenLength = mgos_uart_write(mgos_xymodem_state.uart_no, &modemPacket, payloadLength + 5);
-
-		mgos_uart_flush(mgos_xymodem_state.uart_no);
-
-		if((uint16_t)writtenLength != (payloadLength + 5)) {
-#ifdef MGOS_XYMODEM_DEBUG
-			LOG(LL_INFO, ("Error Writing Packet! Wrote %d instead of %d byte(s)", writtenLength, sizeof(modemPacket)));
-#endif
-			return 0;
-		}
-
-		responseByte = mgos_xymodem_read_uart_byte();
-
-		switch(responseByte) {
-			case MGOS_XYMODEM_ACK:
-#ifdef MGOS_XYMODEM_DEBUG
-				LOG(LL_INFO, ("Packet Acknowledged!"));
-#endif
-				mgos_xymodem_state.packet_number++;
-				break;
-			case MGOS_XYMODEM_NAK:
-#ifdef MGOS_XYMODEM_DEBUG
-				LOG(LL_INFO, ("Packet Not Acknowledged, Retrying..."));
-#endif
-				retries++;
-				break;
-			case MGOS_XYMODEM_CAN:
-				responseByte = mgos_xymodem_read_uart_byte();
-
-				if(responseByte == MGOS_XYMODEM_CAN) {
-#ifdef MGOS_XYMODEM_DEBUG
-					LOG(LL_INFO, ("Target Cancelled Transmission."));
-#endif
-					return MGOS_XYMODEM_CAN;
-				}
-				break;
-			case MGOS_XYMODEM_CRC16:
-#ifdef MGOS_XYMODEM_DEBUG
-				LOG(LL_INFO, ("Got another CRC16 announcement, Retrying..."));
-#endif
-				retries++;
-				break;
-			default:
-#ifdef MGOS_XYMODEM_DEBUG
-				LOG(LL_INFO, ("Unknown Response Byte Received"));
-				mgos_xymodem_hex_dump(NULL, &responseByte, 1);
-#endif
-
-				retries++;
-				break;
-		}
-
-	} while((responseByte != MGOS_XYMODEM_ACK) && (retries <= 10));
-
-	return responseByte;
-}
-
-
-bool mgos_xymodem_transmit(FILE *fp, char *filename, size_t fileSize)
-{
-	uint8_t payload[1024];
-	char str_file_size[64] = "";
-	long int file_position = 0;
-	struct mgos_uart_config uart_config;
-
-	//mgos_uart_flush(mgos_xymodem_state.uart_no);
-
-	mgos_uart_config_set_defaults(mgos_xymodem_state.uart_no, &uart_config);
-
-	uart_config.baud_rate = 9600;
-	uart_config.num_data_bits = 8;
-	uart_config.parity = MGOS_UART_PARITY_NONE;
-	uart_config.stop_bits = MGOS_UART_STOP_BITS_1;
-
-	if(!mgos_uart_configure(mgos_xymodem_state.uart_no, &uart_config)) {
-#ifdef MGOS_XYMODEM_DEBUG
-		LOG(LL_INFO, ("Failed to configure UART for File Transfer"));
-#endif
-		return false;
+	if(tByte != MGOS_XYMODEM_ACK) {
+		LOG(LL_ERROR, ("Failed to receive an ACK of EOT, received 0x%02x instead", tByte));
+		MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_FAILED, NULL);
+		return;
 	}
 
-	mgos_uart_set_dispatcher(mgos_xymodem_state.uart_no, NULL, NULL);
-	mgos_uart_set_rx_enabled(mgos_xymodem_state.uart_no, true);
+	if(packet->protocol == MGOS_XYMODEM_PROTOCOL_YMODEM) {
 
-	if(mgos_xymodem_determine_checksum() == MGOS_XYMODEM_CHECKSUM_NONE) {
-#ifdef MGOS_XYMODEM_DEBUG
-		LOG(LL_INFO, ("No checksum could be determined, cannot continue tranmission"));
-#endif
-		return false;
-	}
+		final_packet = mgos_xymodem_create_packet(MGOS_XYMODEM_STX);
+		final_packet->number = 0;
+		final_packet->is_final = true;
 
-	memset(&payload[0], 0x0, sizeof(payload));
-
-	if(mgos_xymodem_state.protocol == MGOS_XYMODEM_PROTOCOL_YMODEM) {
-
-		mgos_xymodem_state.packet_number = 0;
-
-		//filename = file.name();
-		//filename = filename.substring(filename.lastIndexOf('/') + 1);
-		c_snprintf(str_file_size, sizeof(str_file_size), "%zu", fileSize);
-
-		memcpy(&payload[0], filename, strlen(filename));
-		memcpy(&payload[strlen(filename) + 1], &str_file_size, strlen(str_file_size));
-
-		if(mgos_xymodem_send_payload(&payload[0], strlen(filename) + strlen(str_file_size) + 2, MGOS_XYMODEM_STX) != MGOS_XYMODEM_ACK) {
-#ifdef MGOS_XYMODEM_DEBUG
-			LOG(LL_INFO, ("Failed to receive ACK for Packet.."));
-#endif
-			return false;
+		if(!mgos_xymodem_determine_crc(final_packet)) {
+			MGOS_XYMODEM_FREE_PACKET(final_packet);
+			MGOS_XYMODEM_FREE_PACKET(packet);
+			MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_FAILED, NULL);
+			return;
 		}
+
+		LOG(LL_DEBUG, ("Creating final YModem packet with null filename to end transmission"));
+
+		MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_SEND_PACKET, final_packet);
 
 	} else {
-		mgos_xymodem_state.packet_number = 1;
+		LOG(LL_INFO, ("Transmission Complete!"));
+		MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_COMPLETE, NULL);
 	}
 
-	fseek(fp, 0, SEEK_SET);
+	MGOS_XYMODEM_FREE_PACKET(packet);
+}
 
-	file_position = ftell(fp);
+void mgos_xymodem_on_send_packet(int ev, void *packet_data, void *unused)
+{
+	mgos_xymodem_packet *packet = (mgos_xymodem_packet *)packet_data;
+	mgos_xymodem_packet *next_packet = NULL;
+	uint8_t *uart_packet;
+	uint8_t tByte;
+	uint16_t crc;
+	size_t uart_packet_len, wrote_len, read_len;
 
-	if(file_position < 0) {
-#ifdef MGOS_XYMODEM_DEBUG
-		LOG(LL_INFO, ("Failed to determine file position"));
-#endif
-		return false;
+	LOG(LL_DEBUG, ("Entered Send Packet Event"));
+
+	if(packet->retries > MGOS_XYMODEM_PACKET_RETRY) {
+		LOG(LL_ERROR, ("Attempt to send packet #%d failed %d times, aborting", packet->number, MGOS_XYMODEM_PACKET_RETRY));
+		MGOS_XYMODEM_FREE_PACKET(packet);
+		MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_FAILED, NULL);
+		return;
 	}
 
-	while((unsigned long int)file_position < (unsigned long)fileSize) {
-
-		uint16_t readSize = (fileSize - file_position >= sizeof(payload)) ? sizeof(payload) : (fileSize - file_position);
-
-		memset(&payload[0], 0x0, sizeof(payload));
-
-#ifdef MGOS_XYMODEM_DEBUG
-		LOG(LL_INFO, ("Reading %d byte(s) from source file", readSize));
-#endif
-
-		fread(&payload[0], readSize, 1, fp);
-
-		if(mgos_xymodem_send_payload(&payload[0], readSize, MGOS_XYMODEM_STX) != MGOS_XYMODEM_ACK) {
-#ifdef MGOS_XYMODEM_DEBUG
-			LOG(LL_INFO, ("Failed to recieve ACK for Packet..."));
-#endif
-			return false;
-		}
-
-		file_position = ftell(fp);
-
-		if(file_position < 0) {
-#ifdef MGOS_XYMODEM_DEBUG
-			LOG(LL_INFO, ("Failed to determine file position"));
-#endif
-			return false;
-		}
+	if(packet->crc_type = MGOS_XYMODEM_CRC16) {
+		uart_packet_len = MGOS_XYMODEM_PAYLOAD_SIZE(packet) + 5;
+	} else if(packet->crc_type = MGOS_XYMODEM_CHECKSUM) {
+		uart_packet_len = MGOS_XYMODEM_PAYLOAD_SIZE(packet) + 4;
 	}
 
-	return mgos_xymodem_end_transmission();
-}
+	LOG(LL_DEBUG, ("Setting UART packet size to %zu based on a payload size of %zu and data integrity check", uart_packet_len, MGOS_XYMODEM_PAYLOAD_SIZE(packet)));
 
-void mgos_xymodem_set_protocol(enum mgos_xymodem_protocol_t protocol)
-{
-	mgos_xymodem_state.protocol = protocol;
-}
+	uart_packet = malloc(sizeof(uint8_t) * uart_packet_len);
 
-void mgos_xymodem_set_crc_type(enum mgos_xymodem_checksum_t crcType)
-{
-	mgos_xymodem_state.checksum_type = crcType;
-}
+	if(mgos_uart_read_avail(MGOS_XYMODEM_UART_NO) > 0) {
+		LOG(LL_DEBUG, ("Clearing out UART read buffer"));
+		while(mgos_uart_read(MGOS_XYMODEM_UART_NO, &tByte, 1) > 0);
+	}
 
-void mgos_xymodem_set_uart_no(int uartno)
-{
-	mgos_xymodem_state.uart_no = uartno;
-}
+	memset(uart_packet, 0x0, uart_packet_len);
 
-unsigned int mgos_xymodem_calc_crc(uint8_t data[], uint8_t start, uint16_t length, uint8_t reflectIn, uint8_t reflectOut, uint16_t polynomial, uint16_t xorIn, uint16_t xorOut, uint16_t msbMask, uint16_t mask)
-{
-	unsigned int crc = xorIn;
+	uart_packet[0] = packet->type;
+	uart_packet[1] = packet->number;
+	uart_packet[2] = ~packet->number;
 
-	int j;
-	uint8_t c;
-	unsigned int bit;
+	memcpy(uart_packet + (sizeof(uint8_t) * 3), packet->payload, MGOS_XYMODEM_PAYLOAD_SIZE(packet));
 
-	if (length == 0) return crc;
+	if(packet->crc_type == MGOS_XYMODEM_CRC16) {
 
-	for (int i = start; i < (start + length); i++)
-	{
-		c = data[i];
+		crc = mgos_xymodem_crc16(uart_packet + (sizeof(uint8_t) * 3),
+								0,
+								MGOS_XYMODEM_PAYLOAD_SIZE(packet));
 
-		if (reflectIn != 0)
-			c = (uint8_t) mgos_xymodem_crc_reflect(c, 8);
+		uart_packet[uart_packet_len - 2] = (uint8_t)(crc >> 8) & 0xFF;
+		uart_packet[uart_packet_len - 1] = (uint8_t)(crc & 0xFF);
+	} else {
+		uart_packet[uart_packet_len - 1] = mgos_xymodem_calc_checksum(uart_packet + (sizeof(uint8_t) * 3),
+												MGOS_XYMODEM_PAYLOAD_SIZE(packet)
+										   );
+	}
 
-		j = 0x80;
+	mgos_xymodem_hex_dump("UART Packet", uart_packet, uart_packet_len);
 
-		while (j > 0)
-		{
-			bit = (unsigned int)(crc & msbMask);
-			crc <<= 1;
+	wrote_len = mgos_uart_write(MGOS_XYMODEM_UART_NO, uart_packet, uart_packet_len);
 
-			if ((c & j) != 0)
-			{
-				bit = (unsigned int)(bit ^ msbMask);
+	mgos_uart_flush(MGOS_XYMODEM_UART_NO);
+
+	LOG(LL_DEBUG, ("Wrote UART Packet for packet #%d", packet->number));
+
+	free(uart_packet);
+
+	if(wrote_len != uart_packet_len) {
+		LOG(LL_ERROR, ("Error writing packet to UART, wrote %d byte(s) instead of %d byte(s)", wrote_len, uart_packet_len));
+		MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_FAILED, NULL);
+		return;
+	}
+
+	tByte = mgos_xymodem_read_byte();
+
+	switch(tByte) {
+		case MGOS_XYMODEM_ACK:
+
+			LOG(LL_DEBUG, ("Received ACK of packet #%d", packet->number));
+
+			if(packet->is_final) {
+				LOG(LL_DEBUG, ("Packet was marked as final packet, we're done!"));
+				MGOS_XYMODEM_FREE_PACKET(packet);
+				MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_COMPLETE, NULL);
+				return;
 			}
 
-			if (bit != 0)
-			{
-				crc ^= polynomial;
+			if(feof(packet->fp)) {
+				LOG(LL_DEBUG, ("Packet file reference is now empty, wrapping up"));
+				MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_FINISH, packet);
+				return;
 			}
 
-			j >>= 1;
-		}
+			LOG(LL_DEBUG, ("Creating next packet"));
+
+			next_packet = mgos_xymodem_create_packet(packet->type);
+			next_packet->bytes_sent = packet->bytes_sent + MGOS_XYMODEM_PAYLOAD_SIZE(packet);
+			next_packet->number = packet->number + 1;
+			next_packet->fp = packet->fp;
+			next_packet->type = packet->type;
+			next_packet->file_size = packet->file_size;
+			next_packet->protocol = packet->protocol;
+			next_packet->crc_type = packet->crc_type;
+
+			read_len = fread(next_packet->payload, MGOS_XYMODEM_PAYLOAD_SIZE(packet), 1, next_packet->fp);
+
+			// Technically this is inaccurate, because whatever is < the payload size
+			// hasn't actually been "sent" yet, but for all intents and purposes
+			// it shouldn't be a problem to be off at the very end by < 1024 bytes
+
+			if(read_len != MGOS_XYMODEM_PAYLOAD_SIZE(next_packet)) {
+				next_packet->bytes_sent += read_len;
+			}
+
+			MGOS_XYMODEM_FREE_PACKET(packet);
+			MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_SEND_PACKET, next_packet);
+			return;
+
+		case MGOS_XYMODEM_NAK:
+
+			LOG(LL_DEBUG, ("Received NAK for Packet #%d, retrying", packet->number));
+
+			packet->retries++;
+			MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_SEND_PACKET, packet);
+			return;
+
+		case MGOS_XYMODEM_CAN:
+
+			LOG(LL_DEBUG, ("Received CAN for Packet #%d, confirming..", packet->number));
+			tByte = mgos_xymodem_read_byte();
+
+			if(tByte == MGOS_XYMODEM_CAN) {
+				LOG(LL_INFO, ("Transfer cancelled by destination"));
+				MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_FAILED, NULL);
+				return;
+			}
+
+			LOG(LL_DEBUG, ("Confirmation of CAN failed, retrying packet #%d", packet->number));
+			packet->retries++;
+			MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_SEND_PACKET, packet);
+			return;
+
+		default:
+			LOG(LL_DEBUG, ("Unknown response to packet #%d (0x%02x), retrying", packet->number, tByte));
+			packet->retries++;
+			MGOS_XYMODEM_TRIGGER_EVENT(MGOS_XYMODEM_SEND_PACKET, packet);
+			return;
 	}
-
-	if (reflectOut != 0)
-		crc = (unsigned int)((mgos_xymodem_crc_reflect(crc, 32) ^ xorOut) & mask);
-
-	return crc;
-}
-
-uint8_t mgos_xymodem_crc_reflect(uint8_t data, uint8_t bits)
-{
-	unsigned long reflection = 0x00000000;
-	// Reflect the data about the center bit.
-	for (uint8_t bit = 0; bit < bits; bit++)
-	{
-		// If the LSB bit is set, set the reflection of it.
-		if ((data & 0x01) != 0)
-		{
-			reflection |= (unsigned long)(1 << ((bits - 1) - bit));
-		}
-
-		data = (uint8_t)(data >> 1);
-	}
-
-	return reflection;
 }
