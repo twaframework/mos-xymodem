@@ -33,6 +33,7 @@ void mgos_xymodem_init()
 
 	mgos_event_add_handler(MGOS_XYMODEM_SEND_PACKET, mgos_xymodem_on_send_packet, NULL);
 	mgos_event_add_handler(MGOS_XYMODEM_FINISH, mgos_xymodem_on_finish, NULL);
+	return true;
 }
 
 void mgos_xymodem_set_uart(uint8_t uart_no) {
