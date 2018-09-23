@@ -2,11 +2,13 @@ author: John Coggeshall <john@thissmarthouse.com>
 type: lib
 description: A library implementing X/YModem file transmission over UART
 version: 1.0
+manifest_version: 2017-09-29
+platforms: [ esp32, esp8266 ]
 
 sources:
   - src
 includes:
-  - src
+  - include
 filesystem:
   - fs
 config_schema:
@@ -14,8 +16,6 @@ libs:
 
 tags:
   - c
-
-manifest_version: 2017-09-29
 
 cflags:
   - "-Wno-error=unused-parameter"
